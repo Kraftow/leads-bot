@@ -34,8 +34,12 @@ ADMIN_IDS = {
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()  # Postgres (Neon/Supabase)
 DB_PATH = os.environ.get("DB_PATH", "leads.db")  # запасной вариант: файл SQLite
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Europe/Kyiv"))
+# Заявкой считается только пост, где есть это слово (без учёта регистра; "заявк" ловит
+# и "заявка", и "ЗАЯВКА", и "заявки"). Можно поменять переменной KEYWORD.
+KEYWORD = os.environ.get("KEYWORD", "заявк").strip().lower()
 
 MENU_BTN = "📋 Активные заявки"
+CLOSED_BTN = "🗂 Закрытые заявки"
 STATS_BTN = "📊 Статистика"
 EXPORT_BTN = "📥 Выгрузка"
 
@@ -132,6 +136,29 @@ class SqliteStore:
                 "UPDATE leads SET status=?, fail_reason=?, closed_at=CURRENT_TIMESTAMP "
                 "WHERE id=? AND status='work' AND owner_id=?",
                 (result, reason, lead_id, owner_id),
+            )
+            if cur.rowcount == 0:
+                return None
+            row = c.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone()
+            return dict(row)
+
+    async def closed(self, owner_id, limit=10) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM leads WHERE status IN ('success','fail') "
+                "AND owner_id=? ORDER BY id DESC LIMIT ?",
+                (owner_id, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    async def reclose(self, lead_id, result, reason=None):
+        """Меняет итог уже закрытой заявки (успех / неудача / вернуть в работу)."""
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE leads SET status=?, fail_reason=?, "
+                "closed_at=CASE WHEN ?='work' THEN NULL ELSE CURRENT_TIMESTAMP END "
+                "WHERE id=? AND status IN ('success','fail')",
+                (result, reason, result, lead_id),
             )
             if cur.rowcount == 0:
                 return None
@@ -237,6 +264,27 @@ class PgStore:
         )
         return dict(row) if row else None
 
+    async def closed(self, owner_id, limit=10) -> list[dict]:
+        rows = await self.pool.fetch(
+            "SELECT * FROM leads WHERE status IN ('success','fail') "
+            "AND owner_id=$1 ORDER BY id DESC LIMIT $2",
+            owner_id,
+            limit,
+        )
+        return [dict(r) for r in rows]
+
+    async def reclose(self, lead_id, result, reason=None):
+        """Меняет итог уже закрытой заявки (успех / неудача / вернуть в работу)."""
+        row = await self.pool.fetchrow(
+            "UPDATE leads SET status=$1::text, fail_reason=$2, "
+            "closed_at=CASE WHEN $1::text='work' THEN NULL ELSE now() END "
+            "WHERE id=$3 AND status IN ('success','fail') RETURNING *",
+            result,
+            reason,
+            lead_id,
+        )
+        return dict(row) if row else None
+
     async def leads_since(self, since):
         if since:
             rows = await self.pool.fetch(
@@ -294,7 +342,7 @@ def to_local(v) -> str:
 def menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=MENU_BTN)],
+            [KeyboardButton(text=MENU_BTN), KeyboardButton(text=CLOSED_BTN)],
             [KeyboardButton(text=STATS_BTN), KeyboardButton(text=EXPORT_BTN)],
         ],
         resize_keyboard=True,
@@ -317,17 +365,60 @@ def active_card(r: dict):
     return f"🟡 <b>Заявка #{r['id']}</b>\n\n{short(r['text'])}", kb
 
 
-def reasons_kb(lead_id: int) -> InlineKeyboardMarkup:
+def reasons_kb(lead_id: int, prefix="why", back="back") -> InlineKeyboardMarkup:
     items = list(REASONS.items())
     rows = [
         [
-            InlineKeyboardButton(text=label, callback_data=f"why:{lead_id}:{code}")
+            InlineKeyboardButton(text=label, callback_data=f"{prefix}:{lead_id}:{code}")
             for code, label in items[i : i + 2]
         ]
         for i in range(0, len(items), 2)
     ]
-    rows.append([InlineKeyboardButton(text="↩️ Назад", callback_data=f"back:{lead_id}")])
+    rows.append(
+        [InlineKeyboardButton(text="↩️ Назад", callback_data=f"{back}:{lead_id}")]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def result_line(r: dict) -> tuple[str, str]:
+    """Иконка и подпись итога заявки."""
+    if r["status"] == "success":
+        return "✅", "УСПЕХ"
+    if r["status"] == "fail":
+        reason = REASONS.get(r.get("fail_reason"), "не указана")
+        return "❌", f"НЕУДАЧА\nПричина: {reason}"
+    return "🟡", "В РАБОТЕ"
+
+
+def closed_card(r: dict):
+    icon, label = result_line(r)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✏️ Изменить итог", callback_data=f"edit:{r['id']}"
+                )
+            ]
+        ]
+    )
+    return f"{icon} <b>Заявка #{r['id']} — {label}</b>\n\n{short(r['text'])}", kb
+
+
+def edit_kb(lead_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Успех", callback_data=f"set:{lead_id}:success"),
+                InlineKeyboardButton(text="❌ Неудача", callback_data=f"set:{lead_id}:fail"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 Вернуть в работу", callback_data=f"set:{lead_id}:work"
+                )
+            ],
+            [InlineKeyboardButton(text="↩️ Отмена", callback_data=f"cancel:{lead_id}")],
+        ]
+    )
 
 
 def period_start(code: str):
@@ -397,7 +488,9 @@ def stats_kb(current: str) -> InlineKeyboardMarkup:
 # ---------- Новая заявка в канале ----------
 @router.message(F.chat.id == GROUP_ID, F.is_automatic_forward)
 async def on_channel_post(message: Message, bot: Bot):
-    text = message.text or message.caption or "(без текста)"
+    text = message.text or message.caption or ""
+    if KEYWORD not in text.lower():
+        return  # не заявка (объявление, обычный пост) — игнорируем
     lead_id = await store.create_lead(text, message.message_id)
 
     kb = InlineKeyboardMarkup(
@@ -510,7 +603,16 @@ async def close_lead(cb: CallbackQuery, bot: Bot, lead_id: int, result: str, rea
         extra = f"\nПричина: {REASONS.get(reason, 'не указана')}"
 
     await cb.message.edit_text(
-        f"{icon} <b>Заявка #{lead_id} закрыта — {word}</b>{extra}", reply_markup=None
+        f"{icon} <b>Заявка #{lead_id} закрыта — {word}</b>{extra}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✏️ Изменить итог", callback_data=f"edit:{lead_id}"
+                    )
+                ]
+            ]
+        ),
     )
     await cb.answer("Готово")
 
@@ -568,6 +670,126 @@ async def on_back(cb: CallbackQuery):
     text, kb = active_card(row)
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
+
+
+# ---------- Закрытые заявки и смена итога ----------
+@router.message(F.chat.type == "private", F.text == CLOSED_BTN)
+async def on_closed(message: Message, bot: Bot):
+    if not await is_admin(bot, message.from_user.id):
+        return
+    rows = await store.closed(message.from_user.id, 10)
+    if not rows:
+        await message.answer("Закрытых заявок пока нет.")
+        return
+    await message.answer("Последние закрытые заявки (до 10):")
+    for r in rows:
+        text, kb = closed_card(r)
+        await message.answer(text, reply_markup=kb)
+
+
+async def sync_group_message(bot: Bot, row: dict):
+    """Обновляет статус заявки в комментариях под постом."""
+    if not row.get("group_msg_id"):
+        return
+    if row["status"] == "work":
+        text = (
+            f"🟡 <b>Заявка #{row['id']} — В РАБОТЕ</b>\n"
+            f"Исполнитель: {row['owner_name']}"
+        )
+    else:
+        icon, label = result_line(row)
+        text = (
+            f"{icon} <b>Заявка #{row['id']} — {label}</b>\n"
+            f"Исполнитель: {row['owner_name']}"
+        )
+    try:
+        await bot.edit_message_text(
+            chat_id=GROUP_ID,
+            message_id=row["group_msg_id"],
+            text=text,
+            reply_markup=None,
+        )
+    except Exception:
+        logging.info("Сообщение в группе не изменилось или недоступно")
+
+
+async def apply_new_result(cb: CallbackQuery, bot: Bot, lead_id: int, result, reason):
+    row = await store.reclose(lead_id, result, reason)
+    if not row:
+        await cb.answer("Итог уже изменён или заявка не закрыта", show_alert=True)
+        return
+    await sync_group_message(bot, row)
+
+    if row["status"] == "work":
+        await cb.message.edit_text(
+            f"🟡 <b>Заявка #{lead_id} возвращена в работу</b>\n"
+            f"Она снова в меню «{MENU_BTN}».",
+            reply_markup=None,
+        )
+    else:
+        text, kb = closed_card(row)
+        await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("Итог изменён")
+
+
+@router.callback_query(F.data.startswith("edit:"))
+async def on_edit(cb: CallbackQuery, bot: Bot):
+    if not await is_admin(bot, cb.from_user.id):
+        await cb.answer("Только для администраторов", show_alert=True)
+        return
+    lead_id = int(cb.data.split(":")[1])
+    row = await store.get(lead_id)
+    if not row or row["status"] not in ("success", "fail"):
+        await cb.answer("Заявка не закрыта", show_alert=True)
+        return
+    await cb.message.edit_text(
+        f"✏️ <b>Заявка #{lead_id}</b>\nВыберите новый итог:",
+        reply_markup=edit_kb(lead_id),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("cancel:"))
+async def on_cancel_edit(cb: CallbackQuery):
+    row = await store.get(int(cb.data.split(":")[1]))
+    if not row or row["status"] not in ("success", "fail"):
+        await cb.answer("Заявка не закрыта", show_alert=True)
+        return
+    text, kb = closed_card(row)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("set:"))
+async def on_set(cb: CallbackQuery, bot: Bot):
+    if not await is_admin(bot, cb.from_user.id):
+        await cb.answer("Только для администраторов", show_alert=True)
+        return
+    _, lead_id, result = cb.data.split(":")
+    lead_id = int(lead_id)
+    if result == "fail":
+        await cb.message.edit_text(
+            f"❌ <b>Заявка #{lead_id}</b>\nВыберите причину неудачи:",
+            reply_markup=reasons_kb(lead_id, prefix="rwhy", back="edit"),
+        )
+        await cb.answer()
+        return
+    if result in ("success", "work"):
+        await apply_new_result(cb, bot, lead_id, result, None)
+    else:
+        await cb.answer()
+
+
+@router.callback_query(F.data.startswith("rwhy:"))
+async def on_new_reason(cb: CallbackQuery, bot: Bot):
+    if not await is_admin(bot, cb.from_user.id):
+        await cb.answer("Только для администраторов", show_alert=True)
+        return
+    _, lead_id, code = cb.data.split(":")
+    if code not in REASONS:
+        await cb.answer()
+        return
+    await apply_new_result(cb, bot, int(lead_id), "fail", code)
 
 
 # ---------- Статистика ----------
